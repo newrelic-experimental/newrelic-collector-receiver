@@ -1,0 +1,29 @@
+version: "3"
+services:
+  test-app:
+    build: ./test-app/
+    environment:
+      CORECLR_ENABLE_PROFILING: 1
+      CORECLR_PROFILER: "{36032161-FFC0-4B61-B559-F6C5D41BAE5A}"
+      CORECLR_PROFILER_PATH: "./newrelic/libNewRelicProfiler.so"
+      CORECLR_NEWRELIC_HOME: "./newrelic"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY}"
+      NEW_RELIC_APP_NAME: "agent-to-otel-test-app"
+      NEW_RELIC_HOST: "otel-collector"
+      NEW_RELIC_PORT: 9411
+      NEW_RELIC_DISTRIBUTED_TRACING_ENABLED: "true"
+    ports:
+      - "8080:80"
+    depends_on:
+      - otel-collector
+
+  otel-collector:
+    build: ./
+    environment:
+      LOG_EXPORTER_LOG_LEVEL: "DEBUG"
+      SERVICE_NAME: "agent-to-otel-test-app"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY}"
+    ports:
+      - "4317:4317" # OTLP gRPC receiver
+      - "9411:9411" # nragent receiver
+      - "2345:2345" # docker debugger
