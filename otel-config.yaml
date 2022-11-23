@@ -1,6 +1,5 @@
 extensions:
-  pprof:
-    endpoint: 0.0.0.0:1777
+
   zpages:
     endpoint: 0.0.0.0:55679
 
@@ -9,16 +8,16 @@ receivers:
     protocols:
       grpc:
   nragent:
-    tls_settings:
+    tls:
       cert_file: "./LocalOTelCollectorTesting.cert"
       key_file: "./LocalOTelCollectorTesting.key"
 
 exporters:
   logging:  
   otlp:
-    endpoint: staging-otlp.nr-data.net:4317
+    endpoint: otlp.nr-data.net:443
     headers:
-      api-key: ${NEW_RELIC_LICENSE_KEY}
+      api-key: "api-key"
 
 service:
   pipelines:
@@ -31,4 +30,5 @@ service:
     metrics:
       receivers: [otlp, nragent]
       exporters: [logging, otlp]
-  extensions: [pprof, zpages]
+  extensions: [zpages]
+#  extensions: [pprof, zpages]

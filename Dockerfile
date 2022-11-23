@@ -1,4 +1,4 @@
-FROM cf-registry.nr-ops.net/newrelic/base-go:1.16 as builder
+FROM golang:1.18-alpine as builder
 
 WORKDIR /build
 
@@ -48,5 +48,5 @@ COPY --from=builder /dist /
 #USER nobody
 
 ENTRYPOINT ["/otelcol-nr"]
-CMD ["--config", "/otel-config.yaml", "--log-level", "DEBUG", "--log-profile", "prod"]
+CMD ["--config", "/otel-config.yaml"]
 EXPOSE 1777 55679 4317 9411

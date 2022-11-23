@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 
@@ -40,15 +39,19 @@ func main() {
 	}
 }
 func run(params service.CollectorSettings) error {
-	app, err := service.New(params)
-	if err != nil {
-		return fmt.Errorf("failed to construct the application: %w", err)
+	cmd := service.NewCommand(params)
+	if err := cmd.Execute(); err != nil {
+		log.Fatalf("collector server run finished with error: %v", err)
 	}
-
-	err = app.Run()
-	if err != nil {
-		return fmt.Errorf("application run finished with error: %w", err)
-	}
+	//app, err := service.New(params)
+	//if err != nil {
+	//	return fmt.Errorf("failed to construct the application: %w", err)
+	//}
+	//
+	//err = app.Run()
+	//if err != nil {
+	//	return fmt.Errorf("application run finished with error: %w", err)
+	//}
 
 	return nil
 }

@@ -7,33 +7,32 @@ import (
 	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/receiver/receiverhelper"
-
 	"me.localhost/newrelic-ot-collector/internal/sharedcomponent"
 )
 
 // This file implements factory for Zipkin receiver.
 
 const (
-	typeStr = "nragent"
+	typeStr   = "nragent"
+	stability = component.StabilityLevelBeta
 
 	defaultBindEndpoint = "0.0.0.0:9411"
 )
 
 // NewFactory creates a new New Relic agent receiver factory
 func NewFactory() component.ReceiverFactory {
-	return receiverhelper.NewFactory(
+	return component.NewReceiverFactory(
 		typeStr,
 		createDefaultConfig,
-		receiverhelper.WithTraces(createTracesReceiver),
-		receiverhelper.WithMetrics(createMetricsReceiver),
+		component.WithTracesReceiver(createTracesReceiver, stability),
+		component.WithMetricsReceiver(createMetricsReceiver, stability),
 	)
 }
 
 // createDefaultConfig creates the default configuration for Zipkin receiver.
 func createDefaultConfig() config.Receiver {
 	return &Config{
-		ReceiverSettings: config.NewReceiverSettings(config.NewID(typeStr)),
+		ReceiverSettings: config.NewReceiverSettings(config.NewComponentID(typeStr)),
 		HTTPServerSettings: confighttp.HTTPServerSettings{
 			Endpoint: defaultBindEndpoint,
 		},
@@ -43,12 +42,12 @@ func createDefaultConfig() config.Receiver {
 // createTracesReceiver creates a trace receiver based on provided config.
 func createTracesReceiver(
 	_ context.Context,
-	_ component.ReceiverCreateSettings,
+	set component.ReceiverCreateSettings,
 	cfg config.Receiver,
 	nextConsumer consumer.Traces,
 ) (component.TracesReceiver, error) {
 	r := receivers.GetOrAdd(cfg, func() component.Component {
-		return New(cfg.(*Config))
+		return New(cfg.(*Config), set)
 	})
 
 	if err := r.Unwrap().(*NewRelicAgentReceiver).registerTracesConsumer(nextConsumer); err != nil {
@@ -60,12 +59,12 @@ func createTracesReceiver(
 // CreateMetricsReceiver creates a metrics receiver based on provided config.
 func createMetricsReceiver(
 	_ context.Context,
-	_ component.ReceiverCreateSettings,
+	set component.ReceiverCreateSettings,
 	cfg config.Receiver,
 	nextConsumer consumer.Metrics,
 ) (component.MetricsReceiver, error) {
 	r := receivers.GetOrAdd(cfg, func() component.Component {
-		return New(cfg.(*Config))
+		return New(cfg.(*Config), set)
 	})
 
 	if err := r.Unwrap().(*NewRelicAgentReceiver).registerMetricsConsumer(nextConsumer); err != nil {
