@@ -76,6 +76,7 @@ type ConnectReply struct {
 	// Faster Event Harvest
 	EventData EventHarvestConfig `json:"event_harvest_config"`
 }
+
 type ReplyReturnValue struct {
 	ReturnValue struct {
 		ConnectReply

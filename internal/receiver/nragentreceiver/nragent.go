@@ -11,10 +11,10 @@ import (
 	"errors"
 	"fmt"
 	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/config"
 	"go.opentelemetry.io/collector/consumer"
 	"go.opentelemetry.io/collector/obsreport"
 	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
 
 	//"go.opentelemetry.io/collector/pdata/pmetric"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -36,7 +36,7 @@ type NewRelicAgentReceiver struct {
 	host            component.Host
 	tracesConsumer  consumer.Traces
 	metricsConsumer consumer.Metrics
-	id              config.ComponentID
+	id              component.ID
 
 	shutdownWG        sync.WaitGroup
 	server            *http.Server
@@ -48,7 +48,7 @@ type NewRelicAgentReceiver struct {
 
 	// per-agent state
 	entityGuids sync.Map
-	settings    component.ReceiverCreateSettings
+	settings    receiver.CreateSettings
 }
 
 type agentMeta struct {
@@ -73,10 +73,10 @@ type processAttributes struct {
 var _ http.Handler = (*NewRelicAgentReceiver)(nil)
 
 // New creates a new nragentreceiver.NewRelicAgentReceiver reference.
-func New(config *Config, settings component.ReceiverCreateSettings) *NewRelicAgentReceiver {
+func New(config *Config, settings receiver.CreateSettings) *NewRelicAgentReceiver {
 	fmt.Println("New Called")
 	r := &NewRelicAgentReceiver{
-		id:                config.ID(),
+		id:                settings.ID,
 		config:            config,
 		httpClient:        http.Client{},
 		proxyToNR:         true,
@@ -445,15 +445,11 @@ func (nr *NewRelicAgentReceiver) processConnect(w http.ResponseWriter, r *http.R
 
 func (nr *NewRelicAgentReceiver) proxyConnect(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("proxyConnect")
-	//reqBody := []ConnectInfo{}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	//json.Unmarshal(body, &reqBody)
-	//fmt.Println(reqBody[0].ProcessPid)
-	//fmt.Println(reqBody[0].Env)
 
 	// create a new url from the raw RequestURI sent by the client
 	url := fmt.Sprintf("https://%s%s", nr.redirectHost, r.RequestURI)
@@ -520,8 +516,13 @@ func (nr *NewRelicAgentReceiver) proxyConnect(w http.ResponseWriter, r *http.Req
 			EntityName:        connectInfo[0].AppName[0],
 			processAttributes: procAttributes,
 		}
-		metadataBytes, _ := json.Marshal(metadata)
-		connectStruct.ReturnValue.RequestHeadersMap["new-relic-resource"] = base64.URLEncoding.EncodeToString(metadataBytes)
+		if nr.useResourceHeader {
+			metadataBytes, _ := json.Marshal(metadata)
+			connectStruct.ReturnValue.RequestHeadersMap["new-relic-resource"] = base64.URLEncoding.EncodeToString(metadataBytes)
+		} else {
+			nr.entityGuids.Store(tmp.ReturnValue.RunID, &metadata)
+		}
+
 	} else {
 		fmt.Println(err)
 	}
@@ -569,7 +570,7 @@ func (nr *NewRelicAgentReceiver) processMetricData(w http.ResponseWriter, r *htt
 
 	ctx := r.Context()
 	transportTag := transportType(query)
-	obsrecv := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag, ReceiverCreateSettings: nr.settings})
+	obsrecv, _ := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag, ReceiverCreateSettings: nr.settings})
 	ctx = obsrecv.StartTracesOp(ctx)
 
 	requestBodyReader := processBodyIfNecessary(r)
@@ -579,12 +580,12 @@ func (nr *NewRelicAgentReceiver) processMetricData(w http.ResponseWriter, r *htt
 	}
 	var jsonBody []interface{}
 	json.Unmarshal(bodyBytes, &jsonBody)
-	nrResourceHeader, _ := base64.URLEncoding.DecodeString(r.Header.Get("new-relic-resource"))
-	var agentResource map[string]interface{}
-	json.Unmarshal(nrResourceHeader, &agentResource)
-	fmt.Println("new-relic-resource")
-	fmt.Printf("AgentResource: %v\n", agentResource)
-	fmt.Println(jsonBody[0].(string))
+	//nrResourceHeader, _ := base64.URLEncoding.DecodeString(r.Header.Get("new-relic-resource"))
+	//var agentResource map[string]interface{}
+	//json.Unmarshal(nrResourceHeader, &agentResource)
+	//fmt.Println("new-relic-resource")
+	//fmt.Printf("AgentResource: %v\n", agentResource)
+	//fmt.Println(jsonBody[0].(string))
 	startTimeSeconds := jsonBody[1].(float64)
 	endTimeSeconds := jsonBody[2].(float64)
 	nrMetricData := jsonBody[3].([]interface{})
@@ -687,7 +688,7 @@ func (nr *NewRelicAgentReceiver) processSpanEventRequest(w http.ResponseWriter, 
 	}
 	ctx := r.Context()
 	transportTag := transportType(query)
-	obsrecv := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag, ReceiverCreateSettings: nr.settings})
+	obsrecv, _ := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag, ReceiverCreateSettings: nr.settings})
 	ctx = obsrecv.StartTracesOp(ctx)
 	requestBodyReader := processBodyIfNecessary(r)
 	bodyBytes, _ := io.ReadAll(requestBodyReader)
