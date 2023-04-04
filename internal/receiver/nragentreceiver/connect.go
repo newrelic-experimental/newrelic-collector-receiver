@@ -6,6 +6,7 @@ type ConnectInfo struct {
 	Metadata   map[string]string `json:"metadata"`
 	Language   string            `json:"language"`
 	ProcessPid int               `json:"pid"`
+	Env        [][]interface{}   `json:"environment"`
 	Settings   struct {
 		AppName string `json:"app_name"`
 	}
@@ -74,6 +75,12 @@ type ConnectReply struct {
 
 	// Faster Event Harvest
 	EventData EventHarvestConfig `json:"event_harvest_config"`
+}
+
+type ReplyReturnValue struct {
+	ReturnValue struct {
+		ConnectReply
+	} `json:"return_value"`
 }
 
 // EventHarvestConfig contains fields relating to faster event harvest.

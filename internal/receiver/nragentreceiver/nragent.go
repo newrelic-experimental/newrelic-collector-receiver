@@ -10,66 +10,86 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go.opentelemetry.io/collector/component"
+	"go.opentelemetry.io/collector/consumer"
+	"go.opentelemetry.io/collector/obsreport"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/receiver"
+
+	//"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pcommon"
+	"go.opentelemetry.io/collector/pdata/ptrace"
+
 	"io"
-	"io/ioutil"
 	"math"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
-
-	"go.opentelemetry.io/collector/client"
-	"go.opentelemetry.io/collector/component"
-	"go.opentelemetry.io/collector/component/componenterror"
-	"go.opentelemetry.io/collector/config"
-	"go.opentelemetry.io/collector/consumer"
-	"go.opentelemetry.io/collector/model/pdata"
-	"go.opentelemetry.io/collector/obsreport"
 )
 
 var errNextConsumerRespBody = []byte(`"Internal Server Error"`)
 
-// NewRelicAgentReceiver type is used to handle spans received in the Zipkin format.
+// NewRelicAgentReceiver type is used to handle spans received in the NR Trace format.
 type NewRelicAgentReceiver struct {
 	// addr is the address onto which the HTTP server will be bound
 	host            component.Host
 	tracesConsumer  consumer.Traces
 	metricsConsumer consumer.Metrics
-	id              config.ComponentID
+	id              component.ID
 
-	shutdownWG   sync.WaitGroup
-	server       *http.Server
-	config       *Config
-	httpClient   http.Client
-	redirectHost string
-	proxyToNR    bool
+	shutdownWG        sync.WaitGroup
+	server            *http.Server
+	config            *Config
+	httpClient        http.Client
+	redirectHost      string
+	proxyToNR         bool
+	useResourceHeader bool
 
 	// per-agent state
 	entityGuids sync.Map
+	settings    receiver.CreateSettings
 }
 
 type agentMeta struct {
-	entityGuid string
-	entityName string
+	EntityGuid string `json:"entity.guid"`
+	EntityName string `json:"service.name"`
+	processAttributes
 }
+
+type processAttributes struct {
+	Pid            int           `json:"process.pid"`
+	CommandArgs    []interface{} `json:"process.runtime.command_args"`
+	RuntimeVersion string        `json:"process.runtime.version"`
+	RuntimeName    string        `json:"process.runtime.name"`
+}
+
+//type procAttsReq struct {
+//	Pid      int64           `json:"pid"`
+//	Env      [][]interface{} `json:"environment"`
+//	Language string          `json:"language"`
+//}
 
 var _ http.Handler = (*NewRelicAgentReceiver)(nil)
 
 // New creates a new nragentreceiver.NewRelicAgentReceiver reference.
-func New(config *Config) *NewRelicAgentReceiver {
+func New(config *Config, settings receiver.CreateSettings) *NewRelicAgentReceiver {
+	fmt.Println("New Called")
 	r := &NewRelicAgentReceiver{
-		id:         config.ID(),
-		config:     config,
-		httpClient: http.Client{},
-		proxyToNR:  true,
+		id:                settings.ID,
+		config:            config,
+		httpClient:        http.Client{},
+		proxyToNR:         true,
+		useResourceHeader: true,
+		settings:          settings,
 	}
 	return r
 }
 
 func (nr *NewRelicAgentReceiver) registerTracesConsumer(c consumer.Traces) error {
+	fmt.Println("registerTracesConsumer")
 	if c == nil {
-		return componenterror.ErrNilNextConsumer
+		return component.ErrNilNextConsumer
 	}
 
 	nr.tracesConsumer = c
@@ -77,8 +97,9 @@ func (nr *NewRelicAgentReceiver) registerTracesConsumer(c consumer.Traces) error
 }
 
 func (nr *NewRelicAgentReceiver) registerMetricsConsumer(c consumer.Metrics) error {
+
 	if c == nil {
-		return componenterror.ErrNilNextConsumer
+		return component.ErrNilNextConsumer
 	}
 
 	nr.metricsConsumer = c
@@ -93,9 +114,10 @@ func (nr *NewRelicAgentReceiver) Start(_ context.Context, host component.Host) e
 
 	fmt.Println("nragentreceiver.Start called")
 
+	var err error
 	nr.host = host
-	nr.server = nr.config.HTTPServerSettings.ToServer(nr)
-	var listener net.Listener
+	nr.server, err = nr.config.HTTPServerSettings.ToServer(nr.host, nr.settings.TelemetrySettings, nr)
+	//var listener net.Listener
 	listener, err := nr.config.HTTPServerSettings.ToListener()
 	if err != nil {
 		fmt.Printf("Got error %v", err)
@@ -129,7 +151,8 @@ func (zr *NewRelicAgentReceiver) Shutdown(context.Context) error {
 // a compression such as "gzip", "deflate", "zlib", is found, the body will
 // be uncompressed accordingly or return the body untouched if otherwise.
 // Clients such as Zipkin-Java do this behavior e.g.
-//    send "Content-Encoding":"gzip" of the JSON content.
+//
+//	send "Content-Encoding":"gzip" of the JSON content.
 func processBodyIfNecessary(req *http.Request) io.Reader {
 	switch req.Header.Get("Content-Encoding") {
 	default:
@@ -144,6 +167,7 @@ func processBodyIfNecessary(req *http.Request) io.Reader {
 }
 
 func processResponseBodyIfNecessary(req *http.Response) io.Reader {
+	fmt.Println("processRequestBody")
 	switch req.Header.Get("Content-Encoding") {
 	default:
 		return req.Body
@@ -157,6 +181,7 @@ func processResponseBodyIfNecessary(req *http.Response) io.Reader {
 }
 
 func gunzippedBodyIfPossible(r io.Reader) io.Reader {
+	fmt.Println("gunzippedBody")
 	gzr, err := gzip.NewReader(r)
 	if err != nil {
 		// Just return the old body as was
@@ -166,6 +191,7 @@ func gunzippedBodyIfPossible(r io.Reader) io.Reader {
 }
 
 func zlibUncompressedbody(r io.Reader) io.Reader {
+	fmt.Println("zlibUncompressed")
 	zr, err := zlib.NewReader(r)
 	if err != nil {
 		// Just return the old body as was
@@ -177,36 +203,48 @@ func zlibUncompressedbody(r io.Reader) io.Reader {
 // The NewRelicAgentReceiver receives telemetry data from New Relic agents as JSON,
 // unmarshals them and sends them along to the nextConsumer.
 func (nr *NewRelicAgentReceiver) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("ServeHTTP")
 	fmt.Printf("-- got request %+v", r)
 	fmt.Println()
 
 	query := r.URL.Query()
-
 	switch method := query.Get("method"); method {
 	case "preconnect":
+		fmt.Printf("preconnect")
+		//fmt.Printf("-- got request %+v", r)
 		if nr.proxyToNR {
 			nr.proxyPreconnect(w, r)
 		} else {
 			nr.processPreconnect(w, r)
 		}
 	case "connect":
+		fmt.Printf("connect")
 		if nr.proxyToNR {
 			nr.proxyConnect(w, r)
 		} else {
 			nr.processConnect(w, r)
 		}
 	case "metric_data":
+		fmt.Printf("metric_data")
 		if nr.proxyToNR {
-			nr.proxyRequest(w, r)
+			//nr.proxyRequest(w, r)
+			nr.processMetricData(w, r, query)
 		} else {
 			nr.processMetricData(w, r, query)
 		}
 	case "span_event_data":
+		fmt.Printf("span event data")
 		// Always
 		nr.processSpanEventRequest(w, r, nr.redirectHost, query)
+	case "shutdown":
+		fmt.Println("shutdown")
+		nr.removeEntityGuid(w, r)
+		nr.proxyRequest(w, r)
 	case "":
+		fmt.Println("Receiver not yet implemented")
 		http.Error(w, errors.New("receiver not implemented yet").Error(), http.StatusBadRequest)
 	default:
+		fmt.Printf("default")
 		if nr.proxyToNR {
 			nr.proxyRequest(w, r)
 		} else {
@@ -215,7 +253,13 @@ func (nr *NewRelicAgentReceiver) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 }
 
+func (nr *NewRelicAgentReceiver) removeEntityGuid(w http.ResponseWriter, r *http.Request) {
+	runID := r.URL.Query().Get("run_id")
+	nr.entityGuids.Delete(runID)
+}
+
 func transportType(query url.Values) string {
+	fmt.Printf("transportType")
 	if protocol := query.Get("protocol_version"); protocol != "" {
 		return "http_p" + protocol + "_agent"
 	}
@@ -226,7 +270,8 @@ func transportType(query url.Values) string {
 func (nr *NewRelicAgentReceiver) processPreconnect(w http.ResponseWriter, r *http.Request) {
 	// we need to buffer the body if we want to read it here and send it
 	// in the request.
-	_, err := ioutil.ReadAll(r.Body)
+	fmt.Printf("processPreconnect")
+	_, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -240,14 +285,15 @@ func (nr *NewRelicAgentReceiver) processPreconnect(w http.ResponseWriter, r *htt
 func (nr *NewRelicAgentReceiver) proxyPreconnect(w http.ResponseWriter, r *http.Request) {
 	// we need to buffer the body if we want to read it here and send it
 	// in the request.
-	body, err := ioutil.ReadAll(r.Body)
+	fmt.Printf("proxyPreconnect")
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	// create a new url from the raw RequestURI sent by the client
-	url := fmt.Sprintf("https://staging-collector.newrelic.com%s", r.RequestURI)
+	url := fmt.Sprintf("https://collector.newrelic.com%s", r.RequestURI)
 
 	proxyReq, _ := http.NewRequestWithContext(r.Context(), r.Method, url, bytes.NewReader(body))
 
@@ -278,7 +324,7 @@ func (nr *NewRelicAgentReceiver) proxyPreconnect(w http.ResponseWriter, r *http.
 	fmt.Println()
 
 	responseBodyReader := processResponseBodyIfNecessary(resp)
-	responseBytes, _ := ioutil.ReadAll(responseBodyReader)
+	responseBytes, _ := io.ReadAll(responseBodyReader)
 	if c, ok := responseBodyReader.(io.Closer); ok {
 		_ = c.Close()
 	}
@@ -301,12 +347,14 @@ func (nr *NewRelicAgentReceiver) proxyPreconnect(w http.ResponseWriter, r *http.
 }
 
 func (nr *NewRelicAgentReceiver) processConnect(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("processConnect")
 	bodyReader := processBodyIfNecessary(r)
 	body, err := io.ReadAll(bodyReader)
 	if c, ok := bodyReader.(io.Closer); ok {
 		_ = c.Close()
 	}
 	if err != nil {
+		fmt.Printf("Error found")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -316,7 +364,7 @@ func (nr *NewRelicAgentReceiver) processConnect(w http.ResponseWriter, r *http.R
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
+	fmt.Printf("Trigger process")
 	resourceAttributes := map[string]interface{}{}
 	resourceAttributes["service.name"] = connectInfo[0].AppName[0]
 	// language -> telemetry.sdk.language?
@@ -396,9 +444,8 @@ func (nr *NewRelicAgentReceiver) processConnect(w http.ResponseWriter, r *http.R
 }
 
 func (nr *NewRelicAgentReceiver) proxyConnect(w http.ResponseWriter, r *http.Request) {
-	// we need to buffer the body if we want to read it here and send it
-	// in the request.
-	body, err := ioutil.ReadAll(r.Body)
+	fmt.Println("proxyConnect")
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -407,6 +454,8 @@ func (nr *NewRelicAgentReceiver) proxyConnect(w http.ResponseWriter, r *http.Req
 	// create a new url from the raw RequestURI sent by the client
 	url := fmt.Sprintf("https://%s%s", nr.redirectHost, r.RequestURI)
 
+	fmt.Printf("url is : %v", url)
+	fmt.Println()
 	proxyReq, _ := http.NewRequestWithContext(r.Context(), r.Method, url, bytes.NewReader(body))
 
 	// We may want to filter some headers, otherwise we could just use a shallow copy
@@ -436,21 +485,16 @@ func (nr *NewRelicAgentReceiver) proxyConnect(w http.ResponseWriter, r *http.Req
 	fmt.Println()
 
 	responseBodyReader := processResponseBodyIfNecessary(resp)
-	blob, _ := ioutil.ReadAll(responseBodyReader)
+	blob, _ := io.ReadAll(responseBodyReader)
 	if c, ok := responseBodyReader.(io.Closer); ok {
 		_ = c.Close()
 	}
 
-	responseHeaders := w.Header()
-	for headerKey, headerValues := range resp.Header {
-		for _, headerValue := range headerValues {
-			responseHeaders.Add(headerKey, headerValue)
-		}
+	var connectStruct ReplyReturnValue
+
+	if err := json.Unmarshal(blob, &connectStruct); err != nil {
+		fmt.Printf("Unmarshall Error: %v\n", err)
 	}
-	responseHeaders.Set("Content-Encoding", "identity")
-	responseHeaders.Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	w.Write(blob)
 
 	var connectInfo []ConnectInfo
 	if err := json.Unmarshal(body, &connectInfo); err != nil {
@@ -464,107 +508,111 @@ func (nr *NewRelicAgentReceiver) proxyConnect(w http.ResponseWriter, r *http.Req
 			EntityGuid string `json:"entity_guid"`
 		} `json:"return_value"`
 	}
+	procAttributes := nr.extractProcessAttributes(connectInfo[0])
 
 	if err := json.Unmarshal(blob, &tmp); err == nil {
-		nr.entityGuids.Store(tmp.ReturnValue.RunID, &agentMeta{
-			entityGuid: tmp.ReturnValue.EntityGuid,
-			entityName: connectInfo[0].AppName[0],
-		})
-		fmt.Printf("stored %s: %s\n", tmp.ReturnValue.RunID, tmp.ReturnValue.EntityGuid)
+		metadata := agentMeta{
+			EntityGuid:        tmp.ReturnValue.EntityGuid,
+			EntityName:        connectInfo[0].AppName[0],
+			processAttributes: procAttributes,
+		}
+		if nr.useResourceHeader {
+			metadataBytes, _ := json.Marshal(metadata)
+			connectStruct.ReturnValue.RequestHeadersMap["new-relic-resource"] = base64.URLEncoding.EncodeToString(metadataBytes)
+		} else {
+			nr.entityGuids.Store(tmp.ReturnValue.RunID, &metadata)
+		}
+
 	} else {
 		fmt.Println(err)
 	}
+
+	newBlob, err := json.Marshal(&connectStruct)
+	if err != nil {
+		fmt.Printf("Marshall Error: %v\n", err)
+	}
+
+	responseHeaders := w.Header()
+	for headerKey, headerValues := range resp.Header {
+		for _, headerValue := range headerValues {
+			responseHeaders.Add(headerKey, headerValue)
+		}
+	}
+	responseHeaders.Set("Content-Encoding", "identity")
+	responseHeaders.Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(newBlob)
+}
+
+func (nr *NewRelicAgentReceiver) extractProcessAttributes(req ConnectInfo) processAttributes {
+	processAttributes := processAttributes{}
+	processAttributes.Pid = req.ProcessPid
+	if req.Language == "java" {
+		for _, att := range req.Env {
+			switch att[0] = strings.ToLower(att[0].(string)); att[0] {
+			case "java vm":
+				processAttributes.RuntimeName = att[1].(string)
+			case "java vm version":
+				processAttributes.RuntimeVersion = att[1].(string)
+			case "jvm arguments":
+				processAttributes.CommandArgs = att[1].([]interface{})
+			}
+		}
+	}
+	return processAttributes
 }
 
 func (nr *NewRelicAgentReceiver) processMetricData(w http.ResponseWriter, r *http.Request, query url.Values) {
+	fmt.Println("processMetricData")
 	if nr.metricsConsumer == nil {
 		return
 	}
 
 	ctx := r.Context()
-	if c, ok := client.FromHTTP(r); ok {
-		ctx = client.NewContext(ctx, c)
-	}
-
 	transportTag := transportType(query)
-	obsrecv := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag})
+	obsrecv, _ := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag, ReceiverCreateSettings: nr.settings})
 	ctx = obsrecv.StartTracesOp(ctx)
 
 	requestBodyReader := processBodyIfNecessary(r)
-	bodyBytes, _ := ioutil.ReadAll(requestBodyReader)
+	bodyBytes, _ := io.ReadAll(requestBodyReader)
 	if c, ok := requestBodyReader.(io.Closer); ok {
 		_ = c.Close()
 	}
 	var jsonBody []interface{}
 	json.Unmarshal(bodyBytes, &jsonBody)
-
-	nrResourceHeader, _ := base64.URLEncoding.DecodeString(r.Header.Get("new-relic-resource"))
-	var agentResource map[string]interface{}
-	json.Unmarshal(nrResourceHeader, &agentResource)
-
+	//nrResourceHeader, _ := base64.URLEncoding.DecodeString(r.Header.Get("new-relic-resource"))
+	//var agentResource map[string]interface{}
+	//json.Unmarshal(nrResourceHeader, &agentResource)
+	//fmt.Println("new-relic-resource")
+	//fmt.Printf("AgentResource: %v\n", agentResource)
+	//fmt.Println(jsonBody[0].(string))
 	startTimeSeconds := jsonBody[1].(float64)
 	endTimeSeconds := jsonBody[2].(float64)
 	nrMetricData := jsonBody[3].([]interface{})
 
-	metrics := pdata.NewMetrics()
-	startTime := pdata.Timestamp(startTimeSeconds * 1000 * 1000 * 1000)
-	endTime := pdata.Timestamp(endTimeSeconds * 1000 * 1000 * 1000)
+	metrics := pmetric.NewMetrics()
+	startTime := pcommon.Timestamp(startTimeSeconds * 1000 * 1000 * 1000)
+	endTime := pcommon.Timestamp(endTimeSeconds * 1000 * 1000 * 1000)
 
 	resourceMetrics := metrics.ResourceMetrics().AppendEmpty()
 	resourceAttributes := resourceMetrics.Resource().Attributes()
-	for k, v := range agentResource {
-		switch attributeValue := v.(type) {
-		case string:
-			resourceAttributes.UpsertString(k, attributeValue)
-		case int64:
-			resourceAttributes.UpsertInt(k, attributeValue)
-		case float64:
-			if math.Floor(attributeValue) == attributeValue {
-				resourceAttributes.UpsertInt(k, int64(attributeValue))
-			} else {
-				resourceAttributes.UpsertDouble(k, attributeValue)
-			}
-		case bool:
-			resourceAttributes.UpsertBool(k, attributeValue)
-		default:
-			fmt.Printf("Got unexpected type %T for key %v and value %v", v, k, v)
-			fmt.Println()
-		}
+
+	if nr.useResourceHeader {
+		extractResourcesFromHeader(r, resourceAttributes)
+	} else {
+		nr.extractResourcesFromMap(jsonBody, resourceAttributes)
 	}
 
-	ilMetrics := resourceMetrics.InstrumentationLibraryMetrics().AppendEmpty()
+	ilMetrics := resourceMetrics.ScopeMetrics().AppendEmpty()
 	userAgent := r.Header.Get("User-Agent")
 	splitUserAgent := strings.SplitN(userAgent, "/", 2)
-	ilMetrics.InstrumentationLibrary().SetName(splitUserAgent[0])
-	ilMetrics.InstrumentationLibrary().SetVersion(splitUserAgent[1])
+	ilMetrics.Scope().SetName(splitUserAgent[0])
+	ilMetrics.Scope().SetVersion(splitUserAgent[1])
 
 	otelMetrics := ilMetrics.Metrics()
 	otelMetrics.EnsureCapacity(len(nrMetricData))
-	for i := 0; i < len(nrMetricData); i++ {
-		/*
-			[
-				{
-					“name”:”name of metric”,
-					“scope”:”scope of metric”,
-				},
-				[count, total time, exclusive time, min time, max time, sum of squares]
-			]
-			Uses attributes to differentiate between total time and exclusive time
-			Sum of squares is dropped due to lack of use in the UI
-			Even the apdex special case does not use the sum of squares entry
-		*/
-		timesliceMetric := nrMetricData[i].([]interface{})
-		timesliceMetricNameMap := timesliceMetric[0].(map[string]interface{})
-		timesliceMetricName := timesliceMetricNameMap["name"].(string)
-		timesliceMetricData := timesliceMetric[1].([]interface{})
 
-		if strings.HasPrefix(timesliceMetricName, "WebTransaction/") {
-			mapWebTransactionMetric(&otelMetrics, timesliceMetricName, startTime, endTime, timesliceMetricData)
-		} else if strings.HasPrefix(timesliceMetricName, "External/") {
-			fmt.Println("got a ", timesliceMetricName)
-			mapExternalMetric(&otelMetrics, timesliceMetricName, startTime, endTime, timesliceMetricData)
-		}
-	}
+	TranslateMetrics(otelMetrics, nrMetricData, startTime, endTime)
 
 	consumerErr := nr.metricsConsumer.ConsumeMetrics(ctx, metrics)
 	obsrecv.EndTracesOp(ctx, "nragent", metrics.MetricCount(), consumerErr)
@@ -582,87 +630,11 @@ func (nr *NewRelicAgentReceiver) processMetricData(w http.ResponseWriter, r *htt
 	w.Write([]byte(`{"return_value":[]}`))
 }
 
-func mapWebTransactionMetric(metrics *pdata.MetricSlice, timesliceMetricName string, startTime pdata.Timestamp, endTime pdata.Timestamp, timesliceMetricData []interface{}) {
-	metric := metrics.AppendEmpty()
-	metric.SetDataType(pdata.MetricDataTypeSummary)
-	metric.SetName("http.server.duration")
-	metric.SetUnit("ms")
-	metric.SetDescription(timesliceMetricName)
-
-	summary := metric.Summary()
-	dataPoints := summary.DataPoints()
-	dataPoints.EnsureCapacity(1)
-	inclusiveDataPoint := dataPoints.AppendEmpty()
-
-	inclusiveDataPoint.SetCount(uint64(timesliceMetricData[0].(float64)))
-	inclusiveDataPoint.SetSum(timesliceMetricData[1].(float64) * 1000)
-
-	inclusiveDataPoint.QuantileValues().EnsureCapacity(2)
-	minQuantile := inclusiveDataPoint.QuantileValues().AppendEmpty()
-	minQuantile.SetQuantile(0)
-	minQuantile.SetValue(timesliceMetricData[3].(float64) * 1000)
-	maxQuantile := inclusiveDataPoint.QuantileValues().AppendEmpty()
-	maxQuantile.SetQuantile(1)
-	maxQuantile.SetValue(timesliceMetricData[4].(float64) * 1000)
-
-	inclusiveDataPoint.SetStartTimestamp(startTime)
-	inclusiveDataPoint.SetTimestamp(endTime)
-
-	segments := strings.SplitAfterN(timesliceMetricName, "/", 3)
-	if len(segments) == 3 {
-		route := segments[len(segments)-1]
-		if route == "" {
-			route = "/"
-		}
-		inclusiveDataPoint.LabelsMap().Insert("http.route", route)
-	} else {
-		inclusiveDataPoint.LabelsMap().Insert("http.route", "/")
-	}
-}
-
-func mapExternalMetric(metrics *pdata.MetricSlice, timesliceMetricName string, startTime pdata.Timestamp, endTime pdata.Timestamp, timesliceMetricData []interface{}) {
-	if strings.HasSuffix(timesliceMetricName, "/all") || strings.HasSuffix(timesliceMetricName, "/allWeb") {
-		return
-	}
-
-	metric := metrics.AppendEmpty()
-	metric.SetDataType(pdata.MetricDataTypeSummary)
-	metric.SetName("http.client.duration")
-	metric.SetUnit("ms")
-	metric.SetDescription(timesliceMetricName)
-
-	summary := metric.Summary()
-	dataPoints := summary.DataPoints()
-	dataPoints.EnsureCapacity(1)
-	inclusiveDataPoint := dataPoints.AppendEmpty()
-
-	inclusiveDataPoint.SetCount(uint64(timesliceMetricData[0].(float64)))
-	inclusiveDataPoint.SetSum(timesliceMetricData[1].(float64) * 1000)
-
-	inclusiveDataPoint.QuantileValues().EnsureCapacity(2)
-	minQuantile := inclusiveDataPoint.QuantileValues().AppendEmpty()
-	minQuantile.SetQuantile(0)
-	minQuantile.SetValue(timesliceMetricData[3].(float64) * 1000)
-	maxQuantile := inclusiveDataPoint.QuantileValues().AppendEmpty()
-	maxQuantile.SetQuantile(1)
-	maxQuantile.SetValue(timesliceMetricData[4].(float64) * 1000)
-
-	inclusiveDataPoint.SetStartTimestamp(startTime)
-	inclusiveDataPoint.SetTimestamp(endTime)
-
-	// Ex: External/httpbin.org/Ratpack/GET
-	//     External/<host>/<library>/<procedure>
-	segments := strings.Split(timesliceMetricName, "/")
-	inclusiveDataPoint.LabelsMap().Insert("http.host", segments[1])
-	if len(segments) > 2 {
-		inclusiveDataPoint.LabelsMap().Insert("http.method", segments[len(segments)-1])
-	}
-}
-
 func (nr *NewRelicAgentReceiver) proxyRequest(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("proxyRequest")
 	// we need to buffer the body if we want to read it here and send it
 	// in the request.
-	body, err := ioutil.ReadAll(r.Body)
+	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -710,21 +682,16 @@ func (nr *NewRelicAgentReceiver) proxyRequest(w http.ResponseWriter, r *http.Req
 }
 
 func (nr *NewRelicAgentReceiver) processSpanEventRequest(w http.ResponseWriter, r *http.Request, collectorHost string, query url.Values) {
+	fmt.Println("processSpanEventRequest")
 	if nr.tracesConsumer == nil {
 		return
 	}
-
 	ctx := r.Context()
-	if c, ok := client.FromHTTP(r); ok {
-		ctx = client.NewContext(ctx, c)
-	}
-
 	transportTag := transportType(query)
-	obsrecv := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag})
+	obsrecv, _ := obsreport.NewReceiver(obsreport.ReceiverSettings{ReceiverID: nr.id, Transport: transportTag, ReceiverCreateSettings: nr.settings})
 	ctx = obsrecv.StartTracesOp(ctx)
-
 	requestBodyReader := processBodyIfNecessary(r)
-	bodyBytes, _ := ioutil.ReadAll(requestBodyReader)
+	bodyBytes, _ := io.ReadAll(requestBodyReader)
 	if c, ok := requestBodyReader.(io.Closer); ok {
 		_ = c.Close()
 	}
@@ -733,50 +700,22 @@ func (nr *NewRelicAgentReceiver) processSpanEventRequest(w http.ResponseWriter, 
 
 	nrSpanEvents := jsonBody[2].([]interface{}) //[][]map[string]interface{}]
 
-	traces := pdata.NewTraces()
+	traces := ptrace.NewTraces()
 
 	resourceSpans := traces.ResourceSpans().AppendEmpty()
+	resourceAttributes := resourceSpans.Resource().Attributes()
 
-	if nr.proxyToNR {
-		runToken := jsonBody[0]
-		if v, ok := nr.entityGuids.Load(runToken); ok {
-			meta := v.(*agentMeta)
-			resourceAttributes := resourceSpans.Resource().Attributes()
-			resourceAttributes.UpsertString("entity.guid", meta.entityGuid)
-			resourceAttributes.UpsertString("service.name", meta.entityName)
-		}
+	if nr.useResourceHeader {
+		extractResourcesFromHeader(r, resourceAttributes)
 	} else {
-		agentMetadata, _ := base64.URLEncoding.DecodeString(r.Header.Get("new-relic-resource"))
-		var agentResource map[string]interface{}
-		json.Unmarshal(agentMetadata, &agentResource)
-
-		resourceAttributes := resourceSpans.Resource().Attributes()
-		for k, v := range agentResource {
-			switch attributeValue := v.(type) {
-			case string:
-				resourceAttributes.UpsertString(k, attributeValue)
-			case int64:
-				resourceAttributes.UpsertInt(k, attributeValue)
-			case float64:
-				if math.Floor(attributeValue) == attributeValue {
-					resourceAttributes.UpsertInt(k, int64(attributeValue))
-				} else {
-					resourceAttributes.UpsertDouble(k, attributeValue)
-				}
-			case bool:
-				resourceAttributes.UpsertBool(k, attributeValue)
-			default:
-				fmt.Printf("Got unexpected type %T for key %v and value %v", v, k, v)
-				fmt.Println()
-			}
-		}
+		nr.extractResourcesFromMap(jsonBody, resourceAttributes)
 	}
 
-	ilSpans := resourceSpans.InstrumentationLibrarySpans().AppendEmpty()
+	ilSpans := resourceSpans.ScopeSpans().AppendEmpty()
 	userAgent := r.Header.Get("User-Agent")
 	splitUserAgent := strings.SplitN(userAgent, "/", 2)
-	ilSpans.InstrumentationLibrary().SetName(splitUserAgent[0])
-	ilSpans.InstrumentationLibrary().SetVersion(splitUserAgent[1])
+	ilSpans.Scope().SetName(splitUserAgent[0])
+	ilSpans.Scope().SetVersion(splitUserAgent[1])
 
 	otelSpans := ilSpans.Spans()
 	otelSpans.EnsureCapacity(len(nrSpanEvents))
@@ -795,44 +734,47 @@ func (nr *NewRelicAgentReceiver) processSpanEventRequest(w http.ResponseWriter, 
 		// TODO: Set otel.status_code to ERROR
 
 		spanIdString, _ := getAndRemove(&spanAttributes, "guid")
-		spanIdBytes, _ := hex.DecodeString(spanIdString.StringVal())
-		var spanIdByteArray [8]byte
+		spanIdBytes, _ := hex.DecodeString(spanIdString.Str())
+		var spanIdByteArray pcommon.SpanID
 		copy(spanIdByteArray[:], spanIdBytes)
-		span.SetSpanID(pdata.NewSpanID(spanIdByteArray))
+		span.SetSpanID(spanIdByteArray)
 
 		if parentIdString, found := getAndRemove(&spanAttributes, "parentId"); found {
-			parentIdBytes, _ := hex.DecodeString(parentIdString.StringVal())
-			var parentIdByteArray [8]byte
+			parentIdBytes, _ := hex.DecodeString(parentIdString.Str())
+			var parentIdByteArray pcommon.SpanID
 			copy(parentIdByteArray[:], parentIdBytes)
-			span.SetParentSpanID(pdata.NewSpanID(parentIdByteArray))
+			span.SetParentSpanID(parentIdByteArray)
 		}
 
 		traceIdString, _ := getAndRemove(&spanAttributes, "traceId")
-		traceIdBytes, _ := hex.DecodeString(traceIdString.StringVal())
-		var traceIdByteArray [16]byte
+		traceIdBytes, _ := hex.DecodeString(traceIdString.Str())
+		var traceIdByteArray pcommon.TraceID
 		copy(traceIdByteArray[:], traceIdBytes)
-		span.SetTraceID(pdata.NewTraceID(traceIdByteArray))
+		span.SetTraceID(traceIdByteArray)
 
-		// TODO: Set name to Unknown, but only if missing.
-		name, _ := getAndRemove(&spanAttributes, "name")
-		span.SetName(name.StringVal())
+		name, ok := getAndRemove(&spanAttributes, "name")
+		if ok {
+			span.SetName(name.Str())
+		} else {
+			span.SetName("Unknown")
+		}
 
 		categoryAttribute, _ := getAndRemove(&spanAttributes, "category")
-		switch categoryAttribute.StringVal() {
+		switch categoryAttribute.Str() {
 		case "generic":
 			if _, found := spanAttributes.Get("nr.entryPoint"); found {
-				span.SetKind(pdata.SpanKindServer)
+				span.SetKind(ptrace.SpanKindServer)
 			} else {
-				span.SetKind(pdata.SpanKindInternal)
+				span.SetKind(ptrace.SpanKindInternal)
 			}
 		case "http":
-			span.SetKind(pdata.SpanKindClient)
+			span.SetKind(ptrace.SpanKindClient)
 		default:
-			span.SetKind(pdata.SpanKindInternal)
+			span.SetKind(ptrace.SpanKindInternal)
 		}
 
 		// TODO: Maybe use this if category is not present.
-		spanAttributes.Delete("span.kind")
+		spanAttributes.Remove("span.kind")
 
 		// HTTP translations
 		// httpResponseCode -> http.status_code
@@ -844,44 +786,42 @@ func (nr *NewRelicAgentReceiver) processSpanEventRequest(w http.ResponseWriter, 
 		// request.headers.host -> http.host
 
 		if statusCode, found := getAndRemove(&spanAttributes, "httpResponseCode"); found {
-			spanAttributes.UpsertString("http.status_code", statusCode.StringVal())
+			spanAttributes.PutStr("http.status_code", statusCode.Str())
 		}
 
 		if statusCode, found := getAndRemove(&spanAttributes, "http.statusCode"); found {
-			spanAttributes.UpsertString("http.status_code", statusCode.StringVal())
+			spanAttributes.PutStr("http.status_code", statusCode.Str())
 		}
 
 		if method, found := getAndRemove(&spanAttributes, "request.method"); found {
-			spanAttributes.UpsertString("http.method", method.StringVal())
+			spanAttributes.PutStr("http.method", method.Str())
 		}
 
 		// TODO: Must also provide http.scheme and http.host.
 		if uri, found := getAndRemove(&spanAttributes, "request.uri"); found {
-			spanAttributes.UpsertString("http.target", uri.StringVal())
+			spanAttributes.PutStr("http.target", uri.Str())
 		}
 
 		if host, found := getAndRemove(&spanAttributes, "request.headers.host"); found {
-			spanAttributes.UpsertString("http.host", host.StringVal())
+			spanAttributes.PutStr("http.host", host.Str())
 		}
 
 		if contentLen, found := getAndRemove(&spanAttributes, "request.headers.contentLength"); found {
-			spanAttributes.UpsertInt("http.request_content_length", contentLen.IntVal())
+			spanAttributes.PutInt("http.request_content_length", contentLen.Int())
 		}
 
 		if userAgent, found := getAndRemove(&spanAttributes, "request.headers.userAgent"); found {
-			spanAttributes.UpsertString("http.user_agent", userAgent.StringVal())
+			spanAttributes.PutStr("http.user_agent", userAgent.Str())
 		}
 
 		startTime, _ := getAndRemove(&spanAttributes, "timestamp")
-		span.SetStartTimestamp(pdata.Timestamp(startTime.IntVal() * 1000 * 1000)) //convert from ms to ns
+		span.SetStartTimestamp(pcommon.Timestamp(startTime.Int() * 1000 * 1000)) //convert from ms to ns
 		duration, _ := getAndRemove(&spanAttributes, "duration")
-		endTime := startTime.IntVal() + int64(duration.DoubleVal()*1000)
-		span.SetEndTimestamp(pdata.Timestamp(endTime * 1000 * 1000)) //convert ms to ns
+		endTime := startTime.Int() + int64(duration.Double()*1000)
+		span.SetEndTimestamp(pcommon.Timestamp(endTime * 1000 * 1000)) //convert ms to ns
 	}
-
 	consumerErr := nr.tracesConsumer.ConsumeTraces(ctx, traces)
 	obsrecv.EndTracesOp(ctx, "nragent", traces.SpanCount(), consumerErr)
-
 	if consumerErr != nil {
 		// Transient error, due to some internal condition.
 		w.WriteHeader(http.StatusInternalServerError)
@@ -893,23 +833,25 @@ func (nr *NewRelicAgentReceiver) processSpanEventRequest(w http.ResponseWriter, 
 	w.Header().Add("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{}`))
+
 }
 
-func AddNRAttributesToOTelSpan(nrSpanEventAttributeMap map[string]interface{}, spanAttributes pdata.AttributeMap) {
+func AddNRAttributesToOTelSpan(nrSpanEventAttributeMap map[string]interface{}, spanAttributes pcommon.Map) {
+	fmt.Println("AddNRAttributesToOTelSpan")
 	for nrAttributeKey, nrAttributeValue := range nrSpanEventAttributeMap {
 		switch attributeValue := nrAttributeValue.(type) {
 		case string:
-			spanAttributes.UpsertString(nrAttributeKey, attributeValue)
+			spanAttributes.PutStr(nrAttributeKey, attributeValue)
 		case int64:
-			spanAttributes.UpsertInt(nrAttributeKey, attributeValue)
+			spanAttributes.PutInt(nrAttributeKey, attributeValue)
 		case float64:
 			if math.Floor(attributeValue) == attributeValue {
-				spanAttributes.UpsertInt(nrAttributeKey, int64(attributeValue))
+				spanAttributes.PutInt(nrAttributeKey, int64(attributeValue))
 			} else {
-				spanAttributes.UpsertDouble(nrAttributeKey, attributeValue)
+				spanAttributes.PutDouble(nrAttributeKey, attributeValue)
 			}
 		case bool:
-			spanAttributes.UpsertBool(nrAttributeKey, attributeValue)
+			spanAttributes.PutBool(nrAttributeKey, attributeValue)
 		default:
 			fmt.Printf("Got unexpected type %T for key %v and value %v", nrAttributeValue, nrAttributeKey, nrAttributeValue)
 			fmt.Println()
@@ -917,13 +859,57 @@ func AddNRAttributesToOTelSpan(nrSpanEventAttributeMap map[string]interface{}, s
 	}
 }
 
-func getAndRemove(spanAttributes *pdata.AttributeMap, key string) (pdata.AttributeValue, bool) {
+func getAndRemove(spanAttributes *pcommon.Map, key string) (pcommon.Value, bool) {
+	fmt.Println("getAndRemove")
 	value, ok := spanAttributes.Get(key)
 	if ok {
-		tmp := pdata.NewAttributeValueNull()
+		tmp := pcommon.NewValueEmpty()
 		value.CopyTo(tmp)
 		value = tmp
-		spanAttributes.Delete(key)
+		spanAttributes.Remove(key)
 	}
 	return value, ok
+}
+
+func extractResourcesFromHeader(r *http.Request, resourceAttributes pcommon.Map) {
+	agentMetadata, _ := base64.URLEncoding.DecodeString(r.Header.Get("new-relic-resource"))
+	var agentResource map[string]interface{}
+	json.Unmarshal(agentMetadata, &agentResource)
+
+	for k, v := range agentResource {
+		switch attributeValue := v.(type) {
+		case string:
+			resourceAttributes.PutStr(k, attributeValue)
+		case int64:
+			resourceAttributes.PutInt(k, attributeValue)
+		case float64:
+			if math.Floor(attributeValue) == attributeValue {
+				resourceAttributes.PutInt(k, int64(attributeValue))
+			} else {
+				resourceAttributes.PutDouble(k, attributeValue)
+			}
+		case bool:
+			resourceAttributes.PutBool(k, attributeValue)
+		case []interface{}:
+			slice := resourceAttributes.PutEmptySlice(k)
+			slice.FromRaw(attributeValue)
+		default:
+			fmt.Printf("Got unexpected type %T for key %v and value %v", v, k, v)
+			fmt.Println()
+		}
+	}
+}
+
+func (nr *NewRelicAgentReceiver) extractResourcesFromMap(jsonBody []interface{}, resourceAttributes pcommon.Map) {
+	runToken := jsonBody[0]
+	if v, ok := nr.entityGuids.Load(runToken); ok {
+		meta := v.(*agentMeta)
+		resourceAttributes.PutStr("entity.guid", meta.EntityGuid)
+		resourceAttributes.PutStr("service.name", meta.EntityName)
+		resourceAttributes.PutInt("process.pid", int64(meta.Pid))
+		resourceAttributes.PutStr("process.runtime.name", meta.RuntimeName)
+		resourceAttributes.PutStr("process.runtime.version", meta.RuntimeVersion)
+		commandArgSlice := resourceAttributes.PutEmptySlice("process.command_args")
+		commandArgSlice.FromRaw(meta.CommandArgs)
+	}
 }

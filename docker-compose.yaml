@@ -20,6 +20,13 @@ services:
   otel-collector:
     build: ./
     environment:
+      HTTP_PROXY: "${HTTP_PROXY}"
+      NO_PROXY: "${NO_PROXY}"
+      http_proxy: "${HTTP_PROXY}"
+      https_proxy: "${HTTP_PROXY}"
+      HTTPS_PROXY: "${HTTP_PROXY}"
+      GOPROXY: "${GOPROXY}"
+      GONOPROXY: "${GONOPROXY}"
       LOG_EXPORTER_LOG_LEVEL: "DEBUG"
       SERVICE_NAME: "agent-to-otel-test-app"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY}"
